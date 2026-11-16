@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid21970",
+  "B": "/home/dev/feedback/uid21970",
+  "sha": "c41626e99af0a02ad95a2805979167ad948ecb7b",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "OpenLineage",
+    "repo": "OpenLineage",
+    "sha": "c41626e99af0a02ad95a2805979167ad948ecb7b"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "OpenLineage",
+    "cloneUrl": "https://github.com/Rrr119/OpenLineage.git"
+  },
+  "at": "2026-11-16T01:56:00.081Z"
+}

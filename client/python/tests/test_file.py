@@ -13,7 +13,7 @@ from unittest import mock
 import pytest
 from openlineage.client import OpenLineageClient
 from openlineage.client.run import Job, Run, RunEvent, RunState
-from openlineage.client.transport.file import FileConfig, FileTransport
+from openlineage.client.transport.file import BatchConfig, FileConfig, FileTransport, RetryConfig
 from openlineage.client.uuid import generate_new_uuid
 
 
@@ -486,7 +486,11 @@ def test_file_transport_emit_handles_fsspec_errors():
             raise OSError("Network connection failed")
 
     with mock.patch("openlineage.client.transport.file.import_from_string", return_value=ErrorFileSystem):
-        config = FileConfig(log_file_path=file_path, filesystem="some.error.filesystem")
+        config = FileConfig(
+            log_file_path=file_path,
+            filesystem="some.error.filesystem",
+            retry=RetryConfig(enabled=False),
+        )
 
         transport = FileTransport(config)
 
@@ -845,3 +849,315 @@ def test_file_config_from_dict_with_debug_mode():
 
     config = FileConfig.from_dict(params={"log_file_path": file_path})
     assert config.debug_mode is False  # default
+
+
+def _make_run_event(name: str = "test") -> RunEvent:
+    return RunEvent(
+        eventType=RunState.START,
+        eventTime=datetime.datetime.now().isoformat(),
+        run=Run(runId=str(generate_new_uuid())),
+        job=Job(namespace="file", name=name),
+        producer="prod",
+    )
+
+
+class FlakyFile:
+    """File-like object whose writes fail a configurable number of times before succeeding."""
+
+    def __init__(self, failures: int, files_dict: dict[str, str], path: str, mode: str):
+        self.failures = failures
+        self.attempts = 0
+        self._files = files_dict
+        self.path = path
+        self.mode = mode
+
+    def write(self, content: str) -> None:
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise OSError(f"transient failure {self.attempts}")
+        if self.mode.startswith("a"):
+            self._files[self.path] = self._files.get(self.path, "") + content
+        else:
+            self._files[self.path] = content
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+class FlakyFileSystem:
+    """Filesystem whose open() returns FlakyFile handles."""
+
+    def __init__(self, failures: int = 1):
+        self.failures = failures
+        self.files: dict[str, str] = {}
+        self._handles: dict[str, FlakyFile] = {}
+
+    def open(self, path, mode="r", **kwargs):
+        if path not in self._handles:
+            self._handles[path] = FlakyFile(self.failures, self.files, path, mode)
+        return self._handles[path]
+
+
+class AlwaysFailingFileSystem:
+    def open(self, path, mode="r", **kwargs):
+        raise OSError("object store unavailable")
+
+
+class PermissionDeniedFileSystem:
+    def open(self, path, mode="r", **kwargs):
+        raise PermissionError("access denied")
+
+
+def test_retry_config_and_batch_config_defaults() -> None:
+    config = FileConfig.from_dict({"log_file_path": "/tmp/ol"})
+    assert config.retry.enabled is True
+    assert config.retry.total == 3
+    assert config.batch.enabled is False
+
+    config = FileConfig.from_dict(
+        {
+            "log_file_path": "/tmp/ol",
+            "batch": {"enabled": True, "max_events": 10, "max_wait_millis": 250},
+            "retry": {"enabled": False, "total": 7, "backoff_factor": 0.5},
+        }
+    )
+    assert config.batch.enabled is True
+    assert config.batch.max_events == 10
+    assert config.batch.max_wait_millis == 250
+    assert config.retry.enabled is False
+    assert config.retry.total == 7
+    assert config.retry.backoff_factor == 0.5
+
+
+def test_retry_succeeds_after_transient_failures() -> None:
+    fs = FlakyFileSystem(failures=2)
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        retry=RetryConfig(enabled=True, total=3, backoff_factor=0.001),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    transport.emit(_make_run_event())
+
+    assert len(fs.files) == 1
+    assert list(fs.files.values())[0].count("\n") == 1
+
+
+def test_retry_exhausted_does_not_raise_in_batch_mode() -> None:
+    fs = AlwaysFailingFileSystem()
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        batch=BatchConfig(enabled=True, max_events=1),
+        retry=RetryConfig(enabled=True, total=2, backoff_factor=0.001),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    transport.emit(_make_run_event())
+
+    assert transport.close() is False
+
+
+def test_permission_error_is_not_retried() -> None:
+    fs = PermissionDeniedFileSystem()
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        retry=RetryConfig(enabled=True, total=5, backoff_factor=0.001),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    with pytest.raises(RuntimeError, match="is not writeable"):
+        transport.emit(_make_run_event())
+
+
+def test_batch_flushes_when_max_events_reached_in_append_mode() -> None:
+    written_payloads: list[str] = []
+
+    class RecordingFileSystem:
+        def open(self, path, mode="r", **kwargs):
+            class Handle:
+                def write(self, content):
+                    written_payloads.append(content)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
+            return Handle()
+
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        batch=BatchConfig(enabled=True, max_events=3, max_wait_millis=0),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: RecordingFileSystem().open(path, mode))
+
+    for _ in range(3):
+        transport.emit(_make_run_event())
+
+    assert len(written_payloads) == 1
+    assert written_payloads[0].count("\n") == 3
+    assert transport.close() is True
+
+
+def test_batch_flushes_on_close_without_size_trigger() -> None:
+    fs = FlakyFileSystem(failures=0)
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        batch=BatchConfig(enabled=True, max_events=100, max_wait_millis=0),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    for _ in range(4):
+        transport.emit(_make_run_event())
+
+    assert fs.files == {}
+    assert transport.close() is True
+    assert list(fs.files.values())[0].count("\n") == 4
+
+
+def test_batch_time_based_flush_uses_background_thread() -> None:
+    fs = FlakyFileSystem(failures=0)
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        batch=BatchConfig(enabled=True, max_events=100, max_wait_millis=50),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    transport.emit(_make_run_event())
+    deadline = time.time() + 5
+    while not fs.files and time.time() < deadline:
+        time.sleep(0.02)
+
+    assert fs.files, "background thread should have flushed the buffered event"
+    assert transport.close() is True
+
+
+def test_batch_non_append_mode_writes_individual_files() -> None:
+    fs = FlakyFileSystem(failures=0)
+    config = FileConfig(
+        log_file_path="/tmp/ol/event",
+        append=False,
+        batch=BatchConfig(enabled=True, max_events=2, max_wait_millis=0),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    transport.emit(_make_run_event("job-a"))
+    transport.emit(_make_run_event("job-b"))
+
+    assert len(fs.files) == 2
+    assert all(content.count("\n") == 1 for content in fs.files.values())
+
+
+def test_batched_events_keep_facets_intact() -> None:
+    from openlineage.client.facet import DocumentationJobFacet, NominalTimeRunFacet
+
+    fs = FlakyFileSystem(failures=0)
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        batch=BatchConfig(enabled=True, max_events=1, max_wait_millis=0),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    event = RunEvent(
+        eventType=RunState.START,
+        eventTime=datetime.datetime.now().isoformat(),
+        run=Run(
+            runId=str(generate_new_uuid()),
+            facets={"nominalTime": NominalTimeRunFacet(nominalStartTime="2026-01-01T00:00:00Z")},
+        ),
+        job=Job(
+            namespace="file",
+            name="faceted-job",
+            facets={"documentation": DocumentationJobFacet(description="hello")},
+        ),
+        producer="prod",
+    )
+
+    transport.emit(event)
+
+    written = json.loads(list(fs.files.values())[0])
+    assert written["run"]["facets"]["nominalTime"]["nominalStartTime"] == "2026-01-01T00:00:00Z"
+    assert written["job"]["facets"]["documentation"]["description"] == "hello"
+
+
+def test_emit_after_close_drops_event() -> None:
+    fs = FlakyFileSystem(failures=0)
+    config = FileConfig(
+        log_file_path="/tmp/ol/events",
+        append=True,
+        batch=BatchConfig(enabled=True, max_events=10, max_wait_millis=0),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    assert transport.close() is True
+    transport.emit(_make_run_event())
+
+    assert fs.files == {}
+
+
+def test_batch_non_append_partial_failure_counts_dropped_events() -> None:
+    class PartialFailureFileSystem:
+        def __init__(self):
+            self.files: dict[str, str] = {}
+            self.calls = 0
+
+        def open(self, path, mode="r", **kwargs):
+            self.calls += 1
+
+            class Handle:
+                def __init__(self, outer):
+                    self.outer = outer
+
+                def write(self, content):
+                    if self.outer.calls == 2:
+                        raise OSError("boom")
+                    self.outer.files[path] = content
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
+            return Handle(self)
+
+    fs = PartialFailureFileSystem()
+    config = FileConfig(
+        log_file_path="/tmp/ol/event",
+        append=False,
+        batch=BatchConfig(enabled=True, max_events=3, max_wait_millis=0),
+        retry=RetryConfig(enabled=False),
+    )
+    transport = FileTransport(config)
+    transport._file_handler = mock.Mock(open_file=lambda path, mode: fs.open(path, mode))
+
+    transport.emit(_make_run_event("job-a"))
+    transport.emit(_make_run_event("job-b"))
+    transport.emit(_make_run_event("job-c"))
+
+    assert transport.close() is False
+    assert transport._dropped_events == 1
+    assert len(fs.files) == 2

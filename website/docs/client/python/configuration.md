@@ -1169,6 +1169,8 @@ Designed mainly for integration testing, the `FileTransport` emits OpenLineage e
 - `storage_options` - dictionary, additional options passed to fsspec for authentication and configuration. Optional.
 - `filesystem` - string, dotted import path to a custom filesystem class or instance. Optional, provides explicit control over the filesystem.
 - `fs_kwargs` - dictionary, keyword arguments for constructing the filesystem when using `filesystem`. Optional.
+- `batch` - dictionary, batching configuration that buffers events and writes them together. Optional, disabled by default. See [Batching](#batching).
+- `retry` - dictionary, retry configuration for transient write failures. Optional. See [Retries](#retries).
 
 #### Behavior
 
@@ -1176,6 +1178,55 @@ Designed mainly for integration testing, the `FileTransport` emits OpenLineage e
 - If `append` is `true`, each event will be appended to a single file `log_file_path`, separated by newlines.
 - If `append` is `false`, each event will be written to as separated file with name `{log_file_path}-{datetime}`.
 - When using remote filesystems, the transport automatically handles authentication and connection management through fsspec.
+
+#### Batching
+
+By default every emitted event triggers a separate write. When batching is enabled, events are buffered in memory and written together as a single newline-delimited JSON payload, which significantly reduces the number of file/object-store operations (especially useful for S3/GCS/Azure where each write is an API call).
+
+Configuration fields (all optional):
+
+- `enabled` - boolean, turns batching on. Default: `false`.
+- `max_events` - integer, maximum number of events buffered before an automatic flush. Default: `100`.
+- `max_wait_millis` - integer, maximum age in milliseconds of the oldest buffered event before a background daemon thread flushes it. Set to `0` to disable time-based flushing (flush then happens on size or `close`). Default: `1000`.
+
+Any events still buffered when the client is closed (`OpenLineageClient.close()`) are flushed synchronously. In `append` mode a batch is written to `log_file_path` in one operation; otherwise each event in the batch still gets its own timestamped file.
+
+```yaml
+transport:
+  type: file
+  log_file_path: s3://my-bucket/lineage/events.jsonl
+  append: true
+  storage_options:
+    key: AKIAIOSFODNN7EXAMPLE
+    secret: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  batch:
+    enabled: true
+    max_events: 50
+    max_wait_millis: 5000
+```
+
+#### Retries
+
+Writes against local disks and, more commonly, remote object stores can fail transiently. When retries are enabled, a failed write is retried with exponential backoff (including a small random jitter). Configuration fields (all optional):
+
+- `enabled` - boolean, turns retries on. Default: `true`.
+- `total` - integer, maximum number of retry attempts after the initial write. Default: `3`.
+- `backoff_factor` - float, base delay in seconds; the delay before attempt `n` is `backoff_factor * 2^n`. Default: `0.1`.
+- `max_backoff` - float, upper bound in seconds for a single backoff sleep. Default: `5.0`.
+
+Permission errors and unsupported file modes are considered permanent and are never retried. When all attempts are exhausted while batching is enabled, the affected batch is logged and dropped so that lineage collection never interrupts the instrumented job; `close()` returns `false` if any events were dropped.
+
+```yaml
+transport:
+  type: file
+  log_file_path: s3://my-bucket/lineage/events.jsonl
+  append: true
+  retry:
+    enabled: true
+    total: 5
+    backoff_factor: 0.2
+    max_backoff: 10.0
+```
 
 #### Remote Filesystem Support
 

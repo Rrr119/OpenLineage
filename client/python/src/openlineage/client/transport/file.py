@@ -6,6 +6,9 @@ from __future__ import annotations
 import inspect
 import io
 import logging
+import random
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +32,71 @@ try:
     FSSPEC_AVAILABLE = True
 except ImportError:
     FSSPEC_AVAILABLE = False
+
+
+@dataclass
+class BatchConfig:
+    """Configuration for buffering and batching events before writing them.
+
+    Batching is disabled by default to preserve the historical one-write-per-emit
+    behavior. When enabled, events are buffered in memory and flushed together as a
+    single newline-delimited JSON payload.
+
+    Attributes:
+        enabled (bool): Whether batching is enabled (default: False).
+        max_events (int): Maximum number of events buffered before an automatic flush
+            (default: 100). A value <= 1 flushes on every emitted event.
+        max_wait_millis (int): Maximum age, in milliseconds, of the oldest buffered event
+            before an automatic background flush (default: 1000). A value <= 0 disables
+            time-based flushing, leaving size-based flushing and explicit ``close`` only.
+    """
+
+    enabled: bool = False
+    max_events: int = 100
+    max_wait_millis: int = 1000
+
+    @classmethod
+    def from_dict(cls, params: dict[str, Any] | None) -> BatchConfig:
+        params = params or {}
+        return cls(
+            enabled=bool(params.get("enabled", False)),
+            max_events=int(params.get("max_events", 100)),
+            max_wait_millis=int(params.get("max_wait_millis", 1000)),
+        )
+
+
+@dataclass
+class RetryConfig:
+    """Configuration for retrying failed file/object-store writes.
+
+    Writes can fail transiently, especially against remote object stores accessed through
+    fsspec. Failed writes are retried with exponential backoff. Events that still fail
+    after all attempts are logged and dropped rather than propagated to the caller, so
+    lineage collection never breaks the instrumented job.
+
+    Attributes:
+        enabled (bool): Whether retries are enabled (default: True).
+        total (int): Maximum number of retry attempts after the initial write (default: 3).
+        backoff_factor (float): Base backoff in seconds; the delay before attempt ``n`` is
+            ``backoff_factor * 2 ** n`` with a small random jitter (default: 0.1).
+        max_backoff (float): Upper bound, in seconds, for a single backoff sleep
+            (default: 5.0).
+    """
+
+    enabled: bool = True
+    total: int = 3
+    backoff_factor: float = 0.1
+    max_backoff: float = 5.0
+
+    @classmethod
+    def from_dict(cls, params: dict[str, Any] | None) -> RetryConfig:
+        params = params or {}
+        return cls(
+            enabled=bool(params.get("enabled", True)),
+            total=int(params.get("total", 3)),
+            backoff_factor=float(params.get("backoff_factor", 0.1)),
+            max_backoff=float(params.get("max_backoff", 5.0)),
+        )
 
 
 @dataclass
@@ -56,6 +124,9 @@ class FileConfig(Config):
               For DatasetEvent: uses dataset name with "unknown_event_type" as event type.
               Example: "log_file_path/ol-250115T143052.123456-my_job.name-START.json"
             - JSON output is prettified with indentation for easier reading
+        batch (BatchConfig): Optional batching configuration. When enabled, events are buffered
+            and written together to reduce the number of file/object-store operations.
+        retry (RetryConfig): Optional retry configuration applied to every write attempt.
     """
 
     log_file_path: str
@@ -67,6 +138,8 @@ class FileConfig(Config):
     # Keyword arguments for constructing/calling the filesystem provider
     fs_kwargs: dict[str, Any] | None = None
     debug_mode: bool = False
+    batch: BatchConfig | None = None
+    retry: RetryConfig | None = None
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> FileConfig:
@@ -81,6 +154,8 @@ class FileConfig(Config):
             filesystem=params.get("filesystem"),
             fs_kwargs=params.get("fs_kwargs"),
             debug_mode=params.get("debug_mode", False),
+            batch=BatchConfig.from_dict(params.get("batch")),
+            retry=RetryConfig.from_dict(params.get("retry")),
         )
 
         # Validate configuration
@@ -195,6 +270,9 @@ class FileTransport(Transport):
     1. Auto-detection: Specify only log_file_path with protocol URL
     2. Explicit filesystem: Use 'filesystem' parameter with class/factory/instance
     3. Storage options: Use 'storage_options' for credentials and configuration
+
+    Optionally, events can be buffered and written in batches (see ``BatchConfig``) and
+    transient write failures can be retried with exponential backoff (see ``RetryConfig``).
     """
 
     kind = "file"
@@ -203,11 +281,116 @@ class FileTransport(Transport):
     def __init__(self, config: FileConfig) -> None:
         self.config = config
         self._file_handler = self._create_file_handler()
+        self._buffer: list[tuple[Event, int]] = []
+        self._buffer_lock = threading.RLock()
+        self._buffer_event = threading.Event()
+        self._closed = False
+        self._worker: threading.Thread | None = None
+        self._dropped_events = 0
+        if self.config.batch is None:
+            self.config.batch = BatchConfig()
+        if self.config.retry is None:
+            self.config.retry = RetryConfig()
+        if self.config.batch.enabled and self.config.batch.max_wait_millis > 0:
+            self._worker = threading.Thread(
+                target=self._flush_loop, name="OpenLineageFileTransport", daemon=True
+            )
+            self._worker.start()
         log.debug(
             "Constructing OpenLineage transport that will send events "
             "to file(s) using the following config: %s",
             self.config,
         )
+
+    def _flush_loop(self) -> None:
+        """Background loop that flushes buffered events once they are old enough."""
+        wait_seconds = self.config.batch.max_wait_millis / 1000.0
+        while not self._closed:
+            self._buffer_event.wait(timeout=wait_seconds)
+            self._buffer_event.clear()
+            if self._closed:
+                break
+            with self._buffer_lock:
+                if not self._buffer:
+                    continue
+                oldest_age = (time.monotonic_ns() - self._buffer[0][1]) / 1_000_000
+                if oldest_age >= self.config.batch.max_wait_millis:
+                    self._flush_locked()
+
+    @staticmethod
+    def _serialize(event: Event, debug_mode: bool) -> str:
+        kwargs = {"indent": 2} if debug_mode else {}
+        return Serde.to_json(event, **kwargs)
+
+    def _write_with_retry(self, file_path: str, mode: str, payload: str) -> None:
+        """Write a payload to the target, retrying transient failures with backoff."""
+        retry = self.config.retry
+        attempts = retry.total + 1 if retry.enabled else 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                with self._file_handler.open_file(file_path, mode) as handle:
+                    handle.write(payload)
+                return
+            except (PermissionError, io.UnsupportedOperation) as error:
+                # Wrong mode or missing permissions are not transient: do not retry.
+                msg = f"Log file `{file_path}` is not writeable"
+                raise RuntimeError(msg) from error
+            except Exception as error:
+                last_error = error
+                if attempt == attempts - 1:
+                    break
+                sleep_seconds = min(retry.max_backoff, retry.backoff_factor * (2**attempt))
+                sleep_seconds *= 1 + random.uniform(0, 0.1)
+                log.warning(
+                    "Failed to write to log file `%s` (attempt %d/%d): %s. Retrying in %.3fs",
+                    file_path,
+                    attempt + 1,
+                    attempts,
+                    error,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+        msg = f"Failed to write to log file `{file_path}`: {last_error}"
+        raise RuntimeError(msg)
+
+    def _flush_locked(self) -> None:
+        """Write all currently buffered events. Caller must hold ``_buffer_lock``."""
+        if not self._buffer:
+            return
+        events = [event for event, _ in self._buffer]
+        self._buffer = []
+        if self.config.append:
+            try:
+                payload = "".join(f"{self._serialize(event, self.config.debug_mode)}\n" for event in events)
+                self._write_with_retry(self.config.log_file_path, "a", payload)
+                return
+            except Exception:
+                log.exception(
+                    "Dropping %d OpenLineage event(s) that could not be written to `%s`",
+                    len(events),
+                    self.config.log_file_path,
+                )
+                self._dropped_events += len(events)
+                return
+
+        for event in events:
+            try:
+                file_path = self._get_file_path(event)
+                payload = f"{self._serialize(event, self.config.debug_mode)}\n"
+                self._write_with_retry(file_path, "w", payload)
+            except Exception:
+                self._dropped_events += 1
+                log.exception(
+                    "Dropping an OpenLineage event that could not be written to `%s`",
+                    self.config.log_file_path,
+                )
+
+    def flush(self) -> None:
+        """Force a write of all buffered events. No-op when batching is disabled."""
+        with self._buffer_lock:
+            self._flush_locked()
+        self._buffer_event.set()
 
     def _create_file_handler(self) -> FileHandler:
         """Create the appropriate file handler based on configuration and availability."""
@@ -246,20 +429,48 @@ class FileTransport(Transport):
         return f"{self.config.log_file_path}-{time_str}-{job_name_safe}-{event_type}.json"
 
     def emit(self, event: Event) -> None:
-        log_file_path = self._get_file_path(event)
-        mode = "a" if self.config.append else "w"
+        if self._closed:
+            log.warning("FileTransport is closed; dropping emitted event")
+            return
 
-        log.debug("Openlineage event will be emitted to file: `%s`", log_file_path)
+        if not self.config.batch.enabled:
+            log_file_path = self._get_file_path(event)
+            mode = "a" if self.config.append else "w"
+            log.debug("Openlineage event will be emitted to file: `%s`", log_file_path)
+            self._write_with_retry(log_file_path, mode, f"{self._serialize(event, self.config.debug_mode)}\n")
+            return
 
+        with self._buffer_lock:
+            if self._closed:
+                log.warning("FileTransport is closed; dropping emitted event")
+                return
+            self._buffer.append((event, time.monotonic_ns()))
+            should_flush = len(self._buffer) >= max(1, self.config.batch.max_events)
+            if should_flush:
+                self._flush_locked()
+        if should_flush:
+            self._buffer_event.set()
+        else:
+            log.debug("Openlineage event buffered for batched file emission")
+
+    def close(self, timeout: float = -1) -> bool:
+        """Flush buffered events and stop the background flush thread.
+
+        Returns False when one or more events were dropped because their writes failed
+        even after retries, True otherwise.
+        """
+        if self._closed:
+            return self._dropped_events == 0
+        with self._buffer_lock:
+            self._closed = True
+            self._flush_locked()
+        self._buffer_event.set()
+        if self._worker is not None:
+            self._worker.join(timeout=None if timeout < 0 else timeout)
+        return self._dropped_events == 0
+
+    def __del__(self) -> None:
         try:
-            with self._file_handler.open_file(log_file_path, mode) as f:
-                kwargs = {"indent": 2} if self.config.debug_mode else {}
-                f.write(Serde.to_json(event, **kwargs) + "\n")
-        except (PermissionError, io.UnsupportedOperation) as error:
-            # If we lack write permissions or file is opened in wrong mode
-            msg = f"Log file `{log_file_path}` is not writeable"
-            raise RuntimeError(msg) from error
-        except Exception as error:
-            # Handle fsspec-specific errors or other filesystem errors
-            msg = f"Failed to write to log file `{log_file_path}`: {error}"
-            raise RuntimeError(msg) from error
+            self.close()
+        except Exception:
+            log.debug("Error while closing FileTransport", exc_info=True)
